@@ -1,0 +1,16 @@
+# Core
+torch>=2.1.0
+numpy>=1.24.0
+scipy>=1.11.0
+matplotlib>=3.7.0
+
+# Notebooks
+jupyter>=1.0.0
+ipykernel>=6.0.0
+
+# Testing
+pytest>=7.0.0
+
+# Optional: load .mat reference data from original PINNs repo
+mat73>=0.60          # for MATLAB v7.3 files
+# scipy.io.loadmat handles older .mat files (already in scipy)
