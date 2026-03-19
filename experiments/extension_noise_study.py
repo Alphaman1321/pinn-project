@@ -35,7 +35,7 @@ import matplotlib.pyplot as plt
 from src.continuous.burgers import BurgersPINN, burgers_initial_boundary_data, burgers_collocation_points
 from src.utils.training import train_lbfgs
 
-# ── Configuration ────────────────────────────────────────────────────────────
+#    Configuration                                                             
 NOISE_LEVELS = [0.0, 0.01, 0.05, 0.1, 0.2, 0.5]
 N_SEEDS      = 5
 N_U          = 100
@@ -67,7 +67,7 @@ def run_single(sigma: float, seed: int, n_f: int) -> float:
     torch.manual_seed(seed)
     np.random.seed(seed)
 
-    # ── Data ──
+    #    Data   
     t_u, x_u, u_clean = burgers_initial_boundary_data(N_U, seed=seed)
 
     # Add Gaussian noise to the labels
@@ -87,16 +87,16 @@ def run_single(sigma: float, seed: int, n_f: int) -> float:
         t_f = torch.empty(0, 1, device=DEVICE)
         x_f = torch.empty(0, 1, device=DEVICE)
 
-    # ── Model ──
+    #    Model   
     model = BurgersPINN(n_layers=N_LAYERS, n_neurons=N_NEURONS).to(DEVICE)
 
     def loss_fn():
         return model.loss(t_u, x_u, u_noisy, t_f if n_f > 0 else None, x_f if n_f > 0 else None)
 
-    # ── Train ──
+    #    Train   
     train_lbfgs(model, loss_fn, max_iter=MAX_ITER, log_every=MAX_ITER+1, verbose=False)
 
-    # ── Evaluate on clean test grid ──
+    #    Evaluate on clean test grid   
     # Generate a fine test grid and compare against clean solution
     t_grid = np.linspace(0, 1, 100)
     x_grid = np.linspace(-1, 1, 256)
@@ -125,7 +125,7 @@ def run_single(sigma: float, seed: int, n_f: int) -> float:
     return rel_l2
 
 
-# ── Main study loop ───────────────────────────────────────────────────────────
+#    Main study loop                                                            
 results = {
     'pinn':     {sigma: [] for sigma in NOISE_LEVELS},
     'baseline': {sigma: [] for sigma in NOISE_LEVELS},
@@ -142,7 +142,7 @@ for sigma in NOISE_LEVELS:
         results['baseline'][sigma].append(err_base)
 
 
-# ── Summary table ─────────────────────────────────────────────────────────────
+#    Summary table                                                              
 print("\n" + "=" * 60)
 print(f"{'σ':>6} | {'PINN mean':>12} {'± std':>10} | {'NN mean':>12} {'± std':>10}")
 print("-" * 60)
@@ -154,7 +154,7 @@ for sigma in NOISE_LEVELS:
     print(f"{sigma:6.2f} | {p_mean:12.3e} {p_std:10.3e} | {b_mean:12.3e} {b_std:10.3e}")
 
 
-# ── Plot ──────────────────────────────────────────────────────────────────────
+#    Plot                                                                       
 fig, ax = plt.subplots(figsize=(7, 4))
 
 pinn_means = [np.mean(results['pinn'][s]) for s in NOISE_LEVELS]

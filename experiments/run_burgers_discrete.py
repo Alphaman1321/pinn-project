@@ -1,148 +1,144 @@
 """
 experiments/run_burgers_discrete.py
 -------------------------------------
-Replicates Figure 3 and Tables 3 & 4 from Raissi et al. (2017) — Section 3.1.
+Replicates Figure 3 from Raissi et al. (2017).
 
-Uses a q-stage implicit Runge-Kutta PINN to step from t=0.1 to t=0.9
-in a SINGLE time step (Δt = 0.8) with q=500 stages.
+Loads the exact Burgers' solution from data/burgers_shock.mat,
+takes the snapshot at t=0.1 as training data, and predicts t=0.9
+in a single RK-32 time step.
 
-Theoretical temporal error: Δt^{2q} = 0.8^1000 ≈ 10^{-97}
-
-Expected relative L2 error: ~8.2e-4 (paper), ~1e-3 (ours)
-
-Usage:
-    python experiments/run_burgers_discrete.py
+Download data first:
+    mkdir data
+    curl -L "https://raw.githubusercontent.com/maziarraissi/PINNs/master/main/Data/burgers_shock.mat" -o data/burgers_shock.mat
 """
-
 import sys, os
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import torch
 import numpy as np
 import matplotlib.pyplot as plt
+import scipy.io
 from src.discrete.rk_pinn import RKPINN
-from src.utils.metrics import relative_l2_error
-from src.utils.training import train_lbfgs
+from src.utils.training import train_lbfgs, train_adam
+from src.utils.metrics import relative_l2_numpy
 
-# ── Config (match paper Section 3.1) ────────────────────────────────────────
-NN   = 250    # spatial data points at t^n = 0.1
-Q    = 32    # Runge-Kutta stages  (paper uses 500)
-DT   = 0.8   # single time step: t=0.1 → t=0.9
+#    Config                                                                     
+NN        = 250   # how many of the t=0.1 points to use for training
+Q         = 32    # Runge-Kutta stages (paper uses 500, we use 32)
+DT        = 0.8   # time step: t=0.1 -> t=0.9
 N_LAYERS  = 4
 N_NEURONS = 50
-SEED = 42
-DEVICE = 'cuda' if torch.cuda.is_available() else 'cpu'
+SEED      = 42
+DEVICE    = 'cuda' if torch.cuda.is_available() else 'cpu'
 
 print(f"Device: {DEVICE}")
-print(f"Config: Nn={NN}, q={Q}, Δt={DT}, layers={N_LAYERS}, neurons={N_NEURONS}")
-print(f"Temporal error bound: {DT}^{2*Q} ≈ 10^{int(2*Q*np.log10(DT))}")
+print(f"Config: Nn={NN}, q={Q}, dt={DT}")
 print("-" * 60)
 
+#    Load exact solution from .mat file                                         
+mat_path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'data', 'burgers_shock.mat')
 
-# ── Burgers discrete PINN (subclass RKPINN) ───────────────────────────────────
-class BurgersRKPINN(RKPINN):
-    """Discrete-time PINN for Burgers' equation."""
+if not os.path.exists(mat_path):
+    print("ERROR: data/burgers_shock.mat not found.")
+    print("Please run:")
+    print("  mkdir data")
+    print("  curl -L https://raw.githubusercontent.com/maziarraissi/PINNs/master/main/Data/burgers_shock.mat -o data/burgers_shock.mat")
+    sys.exit(1)
 
-    def nonlinear_operator(self, u, x):
-        """N[u] = u*u_x - (0.01/pi)*u_xx"""
-        import numpy as np
-        nu = 0.01 / np.pi
-        u_x = torch.autograd.grad(
-            u, x, grad_outputs=torch.ones_like(u),
-            create_graph=True, retain_graph=True
-        )[0]
-        u_xx = torch.autograd.grad(
-            u_x, x, grad_outputs=torch.ones_like(u_x),
-            create_graph=True
-        )[0]
-        return u * u_x - nu * u_xx
+data_mat = scipy.io.loadmat(mat_path)
+# t: (100,)  x: (256,)  usol: (256, 100) — solution at every (x, t)
+t_star   = data_mat['t'].flatten()       # time grid
+x_star   = data_mat['x'].flatten()       # space grid
+u_star   = data_mat['usol']              # full solution (256 x 100)
 
-    def boundary_loss(self, x_boundary):
-        """Dirichlet BCs: u(-1) = u(1) = 0 at all stages."""
-        device = next(self.parameters()).device
-        sse_b = torch.tensor(0.0, device=device)
-        for xb in x_boundary:
-            U = self.forward(xb)          # (1, q+1)
-            sse_b = sse_b + torch.sum(U ** 2)
-        return sse_b
+print(f"Loaded exact solution: x in [{x_star.min():.2f}, {x_star.max():.2f}], "
+      f"t in [{t_star.min():.2f}, {t_star.max():.2f}]")
 
+# Find the t=0.1 and t=0.9 snapshots
+t_n_idx   = np.argmin(np.abs(t_star - 0.1))
+t_np1_idx = np.argmin(np.abs(t_star - 0.9))
+print(f"Using t={t_star[t_n_idx]:.4f} as input, t={t_star[t_np1_idx]:.4f} as target")
 
-# ── Data: exact solution at t=0.1 (from analytical / reference) ──────────────
-# We sample Nn points from the exact Burgers solution at t=0.1.
-# Approximate using: u(0.1, x) ≈ -sin(pi*x) evolved slightly.
-# For a proper replication, load from the .mat file in the original repo.
+# Training data: 250 randomly sampled points from the t=0.1 snapshot
+u_n_full = u_star[:, t_n_idx]    # shape (256,)
+u_exact_09 = u_star[:, t_np1_idx] # shape (256,) — ground truth at t=0.9
+
 rng = np.random.default_rng(SEED)
-x_n_np = rng.uniform(-1, 1, (NN, 1)).astype(np.float32)
+idx = rng.choice(len(x_star), NN, replace=False)
+x_n_np = x_star[idx][:, None].astype(np.float32)
+u_n_np = u_n_full[idx][:, None].astype(np.float32)
 
-# Approximate IC: use u(0,x) = -sin(pi*x) as proxy for u(0.1,x)
-# Replace with: scipy.io.loadmat('data/burgers_shock.mat') for exact values
-u_n_np = (-np.sin(np.pi * x_n_np)).astype(np.float32)
-
-x_n = torch.tensor(x_n_np, device=DEVICE, requires_grad=True)
-u_n = torch.tensor(u_n_np, device=DEVICE)
-
-# Boundary points: x = -1 and x = 1
+x_n     = torch.tensor(x_n_np, device=DEVICE, requires_grad=True)
+u_n     = torch.tensor(u_n_np, device=DEVICE)
 x_left  = torch.tensor([[-1.0]], device=DEVICE, requires_grad=True)
 x_right = torch.tensor([[ 1.0]], device=DEVICE, requires_grad=True)
 
 
-# ── Model ─────────────────────────────────────────────────────────────────────
+#    Burgers RK PINN                                                            
+class BurgersRKPINN(RKPINN):
+    def nonlinear_operator(self, u, x):
+        nu = 0.01 / np.pi
+        u_x  = torch.autograd.grad(u,   x, grad_outputs=torch.ones_like(u),   create_graph=True, retain_graph=True)[0]
+        u_xx = torch.autograd.grad(u_x, x, grad_outputs=torch.ones_like(u_x), create_graph=True)[0]
+        return u * u_x - nu * u_xx
+
+    def boundary_loss(self, x_boundary):
+        device = next(self.parameters()).device
+        sse_b = torch.tensor(0.0, device=device)
+        for xb in x_boundary:
+            U = self.forward(xb)
+            sse_b = sse_b + torch.sum(U ** 2)
+        return sse_b
+
 print("Building Runge-Kutta PINN...")
 layer_sizes = [1] + [N_NEURONS] * N_LAYERS + [Q + 1]
 model = BurgersRKPINN(layer_sizes=layer_sizes, q=Q, dt=DT).to(DEVICE)
-n_params = sum(p.numel() for p in model.parameters())
-print(f"Network parameters: {n_params}")
-print(f"Output layer size: {Q + 1} (q={Q} stages + 1 final)")
+print(f"Network parameters: {sum(p.numel() for p in model.parameters())}")
 
-
-# ── Loss closure ──────────────────────────────────────────────────────────────
 def loss_fn():
     total, sse_n, sse_b = model.loss(x_n, u_n, [x_left, x_right])
     return total, sse_n, sse_b
 
+print("\nAdam warmup (2000 iters)...")
+train_adam(model, loss_fn, n_iter=2000, lr=1e-3, log_every=500)
 
-# ── Train ─────────────────────────────────────────────────────────────────────
-print(f"\nTraining with L-BFGS (single step: t=0.1 → t=0.9)...")
-log = train_lbfgs(model, loss_fn, max_iter=50_000, log_every=1000)
+print("\nL-BFGS refinement...")
+log = train_lbfgs(model, loss_fn, max_iter=30_000, log_every=1000)
 
 
-# ── Predict u(t=0.9, x) ───────────────────────────────────────────────────────
-x_test_np = np.linspace(-1, 1, 512).astype(np.float32)[:, None]
-x_test = torch.tensor(x_test_np, device=DEVICE)
+#    Predict and evaluate                                                       
+x_test_np = x_star[:, None].astype(np.float32)  # all 256 spatial points
+x_test    = torch.tensor(x_test_np, device=DEVICE)
 
 model.eval()
 with torch.no_grad():
-    U_out  = model(x_test)        # (512, Q+1)
-    u_next = U_out[:, Q].cpu().numpy()   # final column = u^{n+1}
+    U_out  = model(x_test)
+    u_pred = U_out[:, Q].cpu().numpy().flatten()
 
-# Exact solution at t=0.9 (approximate: near-discontinuous)
-# Replace with loaded exact solution for true L2 error
-u_exact_09 = np.tanh((x_test_np.flatten()) / (2 * 0.01 / np.pi * 0.9 + 1e-8))
-u_exact_09 = np.clip(u_exact_09, -1, 1)   # rough proxy only
-
-rel_l2 = relative_l2_error(
-    torch.tensor(u_next.flatten()),
-    torch.tensor(u_exact_09.flatten())
-)
-print(f"\nRelative L2 error at t=0.9 (approx exact): {rel_l2:.3e}")
-print(f"Paper reports: 8.2e-4  (with true exact solution loaded from .mat)")
+rel_l2 = relative_l2_numpy(u_pred, u_exact_09)
+print(f"\nRelative L2 error at t=0.9: {rel_l2:.4e}")
+print(f"Paper reports: 8.2e-4")
+print(f"Final training loss: {log.total_loss[-1]:.3e}")
 
 
-# ── Plot (reproduces Figure 3) ────────────────────────────────────────────────
+#    Plot                                                                       
 fig, axes = plt.subplots(1, 2, figsize=(10, 3.5))
 
-axes[0].scatter(x_n_np.flatten(), u_n_np.flatten(), s=8, color='red', label='Data (t=0.1)')
+axes[0].scatter(x_n_np.flatten(), u_n_np.flatten(),
+                s=8, color='red', label='Data (t=0.1)', zorder=3)
 axes[0].set_title('t = 0.10  (training data)')
-axes[0].set_xlabel('x');  axes[0].set_ylabel('u(t, x)')
+axes[0].set_xlabel('x'); axes[0].set_ylabel('u(t, x)')
+axes[0].set_xlim([-1, 1]); axes[0].set_ylim([-1.2, 1.2])
 axes[0].legend()
 
-axes[1].plot(x_test_np.flatten(), u_exact_09, 'b-', label='Exact (approx)', linewidth=2)
-axes[1].plot(x_test_np.flatten(), u_next.flatten(), 'r--', label='Prediction', linewidth=2)
-axes[1].set_title('t = 0.90  (prediction)')
-axes[1].set_xlabel('x');  axes[1].set_ylabel('u(t, x)')
+axes[1].plot(x_star, u_exact_09, 'b-',  label='Exact',      linewidth=2)
+axes[1].plot(x_star, u_pred,     'r--', label='Prediction', linewidth=2)
+axes[1].set_title(f't = 0.90  (prediction)  —  rel L2 = {rel_l2:.2e}')
+axes[1].set_xlabel('x'); axes[1].set_ylabel('u(t, x)')
+axes[1].set_xlim([-1, 1]); axes[1].set_ylim([-1.2, 1.2])
 axes[1].legend()
 
-plt.suptitle(f"Burgers' Equation — Discrete-time PINN (q={Q}, Δt={DT})", fontsize=12)
+plt.suptitle(f"Burgers' Equation — Discrete-time PINN (q={Q}, dt={DT})", fontsize=12)
 plt.tight_layout()
 os.makedirs('figures', exist_ok=True)
 plt.savefig('figures/burgers_discrete.png', dpi=150)
